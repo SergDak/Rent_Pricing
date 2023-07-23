@@ -1,0 +1,733 @@
+---
+title: "Predicting Appartment Rent Price"
+author: "Sergei Dakov"
+output:
+ html_document
+subtitle: "Part 3 - Improving The Model Using Boosting"
+---
+
+Previously we have seen that we can get a moderately good prediction using a regression tree by using stratification over the lot types.
+
+one additional way of possibly improving the prediction result is the boosting algorithm.
+Since this regression problem uses tabular data we expect that the boosting algorithm is likely to perform well, we will be following the same steps as with the tree model selection
+```{r message=FALSE,warnings=F, echo=FALSE}
+#load libraries
+library(tidyverse)
+library(tidytext)
+library(parsnip)
+library(rsample)
+library(xgboost)
+library(recipes)
+library(tidygeocoder)
+require(glmnet)
+library(themis)
+```
+
+```{r, echo=FALSE, message= FALSE}
+#load data
+rent_lots <- read_csv("rent.csv") %>%
+  distinct() %>%
+  select(-c('updated')) %>%
+  filter(!is.na(price))
+```
+
+
+```{r message=FALSE, warnings = FALSE, echo=FALSE}
+#load stop words
+stopwords_he <- read_csv("stopwords_he.csv")
+```
+
+
+```{r, echo=FALSE}
+#fu. to calculate RMSE
+get_rmse <- function(truth,prediction){
+  MSE <- mean((truth-prediction)^2)
+  RMSE <- sqrt(MSE)
+  RMSE
+}
+```
+
+
+```{r, echo=FALSE}
+#fun. to fit selected model to a trained recipe
+fit_model <- function(rec,fit_mod) {
+  fit(fit_mod,price~.,data = bake(rec,NULL,all_predictors(),all_outcomes()))
+}
+```
+
+```{r, echo=FALSE}
+#fun. to make predictions based on a fitted model
+pred_model <- function(spl,rec,mod) {
+  mod_baked <- bake(rec,new_data=assessment(spl),all_predictors(),all_outcomes())
+  out <- mod_baked %>% select(price)
+  predicted <- predict(mod,mod_baked,type="raw")
+  out <- out %>% cbind(predicted)
+  names(out) <- c("truth","prediction")
+  out
+}
+
+```
+
+
+```{r, echo=FALSE}
+# perform cross validation, and collect predictions for each split
+train_recipe <- function(rec,rec_name,spl,fit_mod) {
+  spl_prep <- map(spl,prepper,recipe=rec)
+  spl_fit <- map(spl_prep,fit_model,fit_mod=fit_mod)
+  spl_pred <- pmap(lst(spl=spl,rec=spl_prep,mod=spl_fit),pred_model)
+  out <-c()
+  for (i in 1:length(spl_pred)) {
+    current_split <- spl_pred[[i]]
+    3
+    new_val <- get_rmse(current_split$truth,current_split$prediction)
+    out <- c(out,new_val)
+  }
+  out
+}
+```
+
+
+```{r, echo=FALSE}
+# calculate cross validation for a list of recipes and a given model
+calculate_splits <- function(x,lst_recs,fit_mod) {
+  temp_split <- x %>% select(id)
+  for(i in 1:length(lst_recs)) {
+    y <- train_recipe(lst_recs[[i]],names(lst_recs)[i],cv_splits$splits,fit_mod )
+    nm <- names(lst_recs)[i]
+    temp_split <- temp_split %>% mutate(!!nm := y)
+  }
+  temp_split
+}
+```
+
+Define the splits:
+```{r}
+set.seed(1234)
+train_split <- initial_split(rent_lots,strata = 'type')
+rent_train <- training(train_split)
+rent_test <- testing(train_split)
+
+
+
+split_sizes <- c("imbalance"=362,"features"=600,"tuning"=400,"missing"=300)
+
+set.seed(123)
+missing_split <- initial_split(rent_train,strata = 'type',prop = (split_sizes["missing"]+1)/nrow(rent_train))
+rent_missing <- training(missing_split)
+further_split <- testing(missing_split)
+
+set.seed(234)
+imbalance_split <- initial_split(further_split,strata = 'type',prop = (split_sizes["imbalance"]+1)/nrow(further_split))
+rent_imbalance <- training(imbalance_split)
+further_split <- testing(imbalance_split)
+
+set.seed(345)
+features_split <- initial_split(further_split,strata = 'type',prop = split_sizes["features"]/nrow(further_split))
+rent_features <- training(features_split)
+rent_tuning <- testing(features_split)
+```
+
+define the model to be fit, we will start with 30 trees (this number will be tuned later):
+```{r}
+mod_boost <- boost_tree(mode = "regression", engine="xgboost",trees = 30)
+```
+
+
+missing data: 
+* note: since the recipe definition is identical in all parts it is omitted here for brevity, the full recipes can be viewed in the Rmd file
+```{r, echo=FALSE}
+recipe_unknown_mean <- recipe(price~.,data=rent_missing) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())
+
+recipe_unknown_knn <- recipe(price~.,data=rent_missing) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_knn(all_nominal()) %>%
+  step_normalize(all_numeric())
+
+recipe_mode_mean <- recipe(price~.,data=rent_missing) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())
+
+recipe_mode_knn <- recipe(price~.,data=rent_missing) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%
+  step_impute_knn(all_numeric()) %>%
+  step_normalize(all_numeric())
+
+
+```
+
+
+```{r, echo=FALSE}
+set.seed(100)
+cv_splits <- vfold_cv(rent_missing,v=10,strata = 'type')
+
+lst_recs <- list("unknown_mean"=recipe_unknown_mean,
+                 "unknown_knn"=recipe_unknown_knn,
+                 "mode_mean"=recipe_mode_mean,
+                 "mode_knn"=recipe_mode_knn)
+
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_boost)
+cv_res_missing <- cv_splits %>% pivot_longer(cols=names(lst_recs),names_to = "recipe",values_to = "RMSE")%>%
+  select(id,recipe,RMSE) %>% separate(recipe,c("arnona","agency"))%>%
+  group_by(arnona,agency) %>% 
+  summarise (RMSE = mean(RMSE)) %>% arrange(RMSE)
+```
+the treatments of the missing data leads to the followng results -
+```{r}
+cv_res_missing
+```
+The best result in this case is imputing the mode for the text features and mean for the numeric
+
+imbalance:
+
+```{r, echo=FALSE}
+recipe_nothing <- recipe(price~.,data=rent_imbalance) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())
+
+recipe_upsample <-  recipe(price~.,data=rent_imbalance) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric()) %>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_downsample <-  recipe(price~.,data=rent_imbalance) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric()) %>%
+  step_downsample(type,under_ratio=1,seed=100)
+```
+
+
+```{r, echo=FALSE}
+set.seed(100)
+cv_splits <- vfold_cv(rent_imbalance,v=10,strata = 'type')
+
+
+lst_recs <- list("nothing"=recipe_nothing,
+                 "upsample"=recipe_upsample,
+                 "downsample"=recipe_downsample)
+
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_boost)
+cv_res_imbalance <- cv_splits %>% pivot_longer(cols=names(lst_recs),names_to = "recipe",values_to = "RMSE")%>%
+  select(id,recipe,RMSE) %>% group_by(recipe) %>%
+  summarise (RMSE = mean(RMSE)) %>% arrange(RMSE)
+```
+the imbalacne results are as follows:
+```{r}
+cv_res_imbalance
+```
+ In this case, the best performing option is to up-sample the lower representation categories, unlike the single tree model that required no action
+
+Feature engineering:
+
+```{r , echo=FALSE}
+train_recycled <- rent_features %>% rbind(rent_imbalance) %>% rbind(rent_missing)
+train_recycled_words <- train_recycled %>% select(id,price,description) %>%
+  unnest_tokens(word,description) %>%
+  filter(!word %in% stopwords_he$word,str_detect(word,"[א-ת]"))
+
+top_words <- train_recycled_words %>% count(id,word) %>% count(word) %>% filter(n>50) %>% pull(word)
+```
+
+```{r, echo=FALSE}
+train_recycled_words_unique <- train_recycled_words %>% count(id,word)
+
+words_means <- function(target_word) {
+ abc <- train_recycled_words_unique %>% filter(word==target_word) %>% pull(id)
+ found <- train_recycled %>% filter(id %in% abc) %>% pull(price)
+ absent <- train_recycled %>% filter(!id %in% abc) %>% pull(price)
+ abs(mean(found)-mean(absent))
+}
+mean_diff <- sapply(top_words,words_means)
+```
+
+```{r, echo=FALSE}
+words_u <- function(target_word) {
+  abc <- train_recycled_words_unique%>% filter(word==target_word) %>% pull(id)
+  found <- train_recycled %>% filter(id %in% abc) %>% pull(price)
+  absent <- train_recycled %>% filter(!id %in% abc) %>% pull(price)
+  wilcox.test(found,absent)$p.value
+}
+u_pvals <- sapply(top_words,words_u)
+```
+
+```{r, echo=FALSE}
+results <- cbind.data.frame(U_test = u_pvals,mean_differences = mean_diff,word = names(u_pvals))
+results <- results %>% mutate(p_adjusted = p.adjust(u_pvals,method = "BH")) %>% mutate(diff_scaled = scale(mean_differences)[,1])
+important_words_method1 <- results %>% filter(abs(diff_scaled)>1) %>% pull(word)
+important_words_method2 <- results %>% filter(p_adjusted<10e-4) %>% pull(word)
+```
+
+
+```{r, echo=FALSE}
+count_words <- function(word_vec,data_vec) {
+  counts <- map(word_vec,~str_count(data_vec,.x))
+  names(counts)= word_vec
+  counts
+}
+```
+
+```{r, echo=FALSE}
+all_important_words <- c(important_words_method1,important_words_method2) %>% unique()
+train_words_all <- rent_features %>% bind_cols(count_words(all_important_words,rent_features$description))
+important_words_not_dist <- all_important_words[!all_important_words %in% important_words_method2]
+important_words_not_mean <- all_important_words[!all_important_words %in% important_words_method1]
+```
+
+```{r, echo=FALSE, message=FALSE}
+train_words_all <- geocode(train_words_all,street = street,city= city,method="osm",lat = latitude, long = longtitude)
+```
+
+
+```{r echo=FALSE}
+recipe_nothing <- recipe(price~.,data=train_words_all) %>%
+  step_rm(c(city,neighbourhood,street,description,id)) %>%
+  step_rm(all_of(all_important_words)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+
+
+recipe_mean_full_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_mean_other_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_other(c(city,street,neighbourhood)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_mean_geo_keep <- recipe(price~.,data = train_words_all) %>%
+  step_rm(c(description,id)) %>%
+  step_rm(c(city,neighbourhood,street)) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_full_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_other_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_other(c(city,street,neighbourhood))%>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_geo_keep <- recipe(price~.,data = train_words_all) %>%
+  step_rm(c(description,id)) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_rm(c(city,neighbourhood,street)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_mean_drop_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_rm(c(city,street,neighbourhood)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_drop_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_rm(c(city,street,neighbourhood)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_drop_full_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(all_important_words)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_drop_other_keep <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(all_important_words)) %>%
+  step_other(c(city,street,neighbourhood)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_drop_geo_keep <- recipe(price~.,data = train_words_all) %>%
+  step_rm(c(description,id)) %>%
+  step_rm(all_of(all_important_words)) %>%
+  step_rm(c(city,neighbourhood,street)) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_mean_full_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_mean_other_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_other(city,street,neighbourhood) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_mean_geo_other <- recipe(price~.,data = train_words_all) %>%
+  step_rm(c(description,id)) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_rm(city,neighbourhood,street) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_full_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_other_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_other(city,street,neighbourhood)%>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_geo_other <- recipe(price~.,data = train_words_all) %>%
+  step_rm(c(description,id)) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_rm(c(city,neighbourhood,street)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_mean_drop_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_mean)) %>%
+  step_rm(c(city,street,neighbourhood)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_dist_drop_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(important_words_not_dist)) %>%
+  step_rm(c(city,street,neighbourhood)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_drop_full_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(all_important_words)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_drop_other_other <- recipe(price~.,data=train_words_all) %>%
+  step_rm(description,id,latitude,longtitude) %>%
+  step_rm(all_of(all_important_words)) %>%
+  step_other(c(city,street,neighbourhood)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+
+recipe_drop_geo_other <- recipe(price~.,data = train_words_all) %>%
+  step_rm(c(description,id)) %>%
+  step_rm(all_of(all_important_words)) %>%
+  step_rm(c(city,neighbourhood,street)) %>%
+  step_other(agency,type,entry_date) %>%
+  step_string2factor(all_nominal()) %>%
+  step_impute_mode(all_nominal()) %>%   step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric())%>%
+  step_upsample(type,over_ratio=1,seed=100)
+```
+
+```{r, echo=FALSE}
+lst_recs <- list("nothing_nothing_nothing"=recipe_nothing,
+                 "mean_full_keep"=recipe_mean_full_keep,
+                 "mean_other_keep"=recipe_mean_other_keep,
+                 "mean_geo_keep"=recipe_mean_geo_keep,
+                 "mean_drop_keep"=recipe_mean_drop_keep,
+                 "dist_full_keep"=recipe_dist_full_keep,
+                 "dist_other_keep"=recipe_dist_other_keep,
+                 "dist_geo_keep"=recipe_dist_geo_keep,
+                 "dist_drop_keep"=recipe_dist_drop_keep,
+                 "drop_full_keep"=recipe_drop_full_keep,
+                 "drop_other_keep"=recipe_drop_other_keep,
+                 "drop_geo_keep"=recipe_drop_geo_keep,
+                 "mean_full_other"=recipe_mean_full_other,
+                 "mean_other_other"=recipe_mean_other_other,
+                 "mean_geo_other"=recipe_mean_geo_other,
+                 "mean_drop_other"=recipe_mean_drop_other,
+                 "dist_full_other"=recipe_dist_full_other,
+                 "dist_other_other"=recipe_dist_other_other,
+                 "dist_geo_other"=recipe_dist_geo_other,
+                 "dist_drop_other"=recipe_dist_drop_other,
+                 "drop_full_other"=recipe_drop_full_other,
+                 "drop_other_other"=recipe_drop_other_other,
+                 "drop_geo_other"=recipe_drop_geo_other)
+set.seed(100)
+cv_splits <- vfold_cv(train_words_all,v=10,strata = 'type')
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_boost)
+cv_res_text <- cv_splits %>% pivot_longer(cols=names(lst_recs),names_to = "recipe",values_to = "RMSE")%>%
+  select(id,recipe,RMSE) %>%  separate(recipe,c("text_feature","location_feature","nominal_feature"))%>%
+    group_by(text_feature,location_feature,nominal_feature) %>% 
+    summarise (RMSE = mean(RMSE)) %>% arrange(RMSE)
+```
+the results for this step are:
+```{r}
+cv_res_text
+```
+
+the best result was on using the difference in means, using the full address data and adding an "other" level to all other nominal features, yielding an RMSE of 0.855 (compared to the single tree model providing an RMSE of 0.869)
+
+The final step is tuning the model, that is, selecting the hyper-parameters that leads to the best results.
+The hyper parameters in the selected model are:
+1) the ratio at which a level is considered to be significant v "other"
+2) the ratio for upsampling
+3) number of trees in the boosting ensemble
+
+since we need to check each combination of each of those three parameters, this means many models would need to be fit and compared (for example, if we test 10 options for each parameter, we would need to compare 10x10x10=1000 models)
+this is a task that is computationally hard, thus we resort to using the tune package to optimize this process
+note that since the tune library does not operate with non-numeric variables, several additional conversion steps are added to the preprocessing recipe to conform to those requirements
+```{r}
+library(tune)
+library(yardstick)
+
+set.seed(100)
+cv_splits <- vfold_cv(train_words_all,v=10,strata = 'type')
+
+trees = seq(10,100,by=10)
+threshold = seq(0.01,0.1,len = 10)
+ratio <- seq(0.5,1.5,len=11)
+tuning_vars <- expand.grid("trees"=trees
+                           ,"threshold"=threshold
+                           ,"over_ratio"=ratio
+                          )
+
+important_words_method1 <- results %>% filter(abs(diff_scaled)>1) %>% pull(word)
+train_tuning_all <- rent_tuning %>% bind_cols(count_words(important_words_method1,rent_tuning$description))
+train_tuning_all <- train_tuning_all %>% mutate(neighbourhood =str_replace_all(neighbourhood,"[:punct:]",""))
+ mod_boost_tuning <- boost_tree(mode="regression",engine = "xgboost",trees = tune())
+ 
+ recipe_tuning <- recipe(price~.,data=train_tuning_all) %>%
+   step_rm(description,id) %>%
+   step_mutate(neighbourhood = str_remove(neighbourhood,"-")) %>%
+   step_mutate(city = str_replace_all(city,"-"," ")) %>%
+   step_other(agency,type,entry_date,neighbourhood,threshold =tune()) %>%
+   step_string2factor(all_nominal()) %>%
+   step_impute_mode(all_nominal()) %>%
+   step_impute_mean(all_numeric()) %>%
+   step_normalize(all_numeric())%>%
+   step_upsample(type,over_ratio=tune(),seed=100) %>%
+   step_mutate(across(where(is.logical),as.numeric)) %>%
+   step_dummy(all_nominal())
+ 
+ formula_res <- mod_boost_tuning %>% tune_grid(object = mod_boost_tuning,
+                                               preprocessor = recipe_tuning,
+                                               resamples = cv_splits,
+                                               metrics = metric_set(rmse),
+                                               grid = tuning_vars
+                                               )
+ 
+ col_rmse <- collect_metrics(formula_res)
+ 
+ col_rmse %>% arrange(mean) %>% head(10)
+```
+the optimal calculated values are 20 trees, cutoff threshold of 0.09 (of the entire split), and a up-sampling ratio of 0.5 (i.e. up sample all rare occurrences to a ratio of 0.5 of the most prominent class) 
+
+to estimate the prediction quality of the selected model we can now fit the model on the entire training data set and verified on the test data set:
+```{r}
+important_words_method1 <- results %>% filter(abs(diff_scaled)>0) %>% pull(word)
+train_final_all <- rent_train %>% bind_cols(count_words(important_words_method1,rent_train$description))
+test_final_all <- rent_test %>% bind_cols(count_words(important_words_method1,rent_test$description))
+    
+recipe_complete <- recipe(price~.,data=train_final_all) %>%
+   step_rm(description,id) %>%
+   step_other(agency,type,entry_date,neighbourhood,threshold =0.09) %>%
+   step_string2factor(all_nominal()) %>%
+   step_impute_mode(all_nominal()) %>%
+   step_impute_mean(all_numeric()) %>%
+   step_normalize(all_numeric())%>%
+   step_upsample(type,over_ratio=0.5,seed=100) %>%
+   prep()
+
+train_final <- bake(recipe_complete,NULL,all_predictors(),all_outcomes())
+test_final <- bake(recipe_complete,test_final_all,all_predictors(),all_outcomes())
+
+fit_final <- fit(mod_boost,price~.,data=train_final)
+prediction_final <- predict(fit_final, test_final)
+get_rmse(test_final$price,prediction_final$.pred)
+```
+the final calculated RMSE is 0.568, a marked improvement over the single tree model (RMSE of 0.738), and even better than the tree model after removing the outliers (RMSE of 0.626), thus both improving prediction quality as well as proving the viability of a boosting model on tabulary data
+
+#using Exploratory Data analysis to check model strengths and weaknesses:
+similarly to the single tree model we can explore the performance of the boosted model to see where it performs well versus potential points where it may struggle
+```{r}
+test_final <- test_final %>% cbind(prediction_final)
+bad_preds <- test_final %>% mutate(res_squared = (price-.pred)^2)  %>% filter(res_squared>10)
+bad_preds %>% pull(price) -> bad_prices
+(bad_prices * sd(rent_train$price)) + mean(rent_train$price)
+
+```
+
+in this case there are two strong outliers, looking at the price listed for both of them, it is once again easy to say they do not represent a typical listing
+```{r}
+fixed_preds <- test_final %>% mutate(res_squared = (price-.pred)^2)  %>% filter(!res_squared>10)
+fixed_preds %>% pull(res_squared) %>% mean(.) %>% sqrt(.)
+```
+
+ignoring those outliers the prediction quality improves somewhat, the change is not as dramatic as in the single tree model. but still marks a noticeable improvement, the corrected error being 20% smaller than before
+
+rent visualization:
+```{r}
+library(ggplot2)
+```
+we can start with a box plot to see the spread of the results:
+```{r}
+test_final %>% select(type,price,.pred) %>% mutate(res_squared = (price-.pred)^2) %>% mutate(RSE = sqrt(res_squared)) %>% ggplot(aes(x=type,y=RSE)) +
+  geom_boxplot()+
+  geom_hline(yintercept=1,col="red")+
+  geom_hline(yintercept = 0.4565759,col="blue")+
+  theme_bw()+
+  labs(y="Error",title = "Residual Error By Lot Type")+
+  theme(plot.title = element_text(hjust = 0.5),axis.text.x = element_text(angle = 60, hjust=1))
+```
+
+the first thing to note is that the model collapsed all lot types to one of: apartment,unit or "other". taking into account that this is the optimal model out of the ones trialed (including not collapsing the classes) it is possible that all the other lot types were rare enough in the data that it was impossible to learn much from them (thus leading to over-fit)
+additionally, all three classes have their median result below the RMSE value, and the 75% quantile lower than 1, that is most predictions fall within a single standard deviation
+We can also see the outliers noted earlier in this plot, and see how significant their error is compared to the rest of the data
+
+to further see the distribution of the errors of the predictions we will use a violin plot.
+such a plot will allow us to see an approximated distribution of the data, as the box plot only highlights quantiles in the data and multiple distributions may share identical quantiles.
+```{r}
+
+test_final %>% select(type,price,.pred) %>% mutate(res_squared = (price-.pred)^2) %>% mutate(RSE = sqrt(res_squared)) %>% ggplot(aes(x=type,y=RSE)) +
+  geom_violin(draw_quantiles = 0.9,trim = TRUE,linetype="dotted")+
+  geom_violin(draw_quantiles = c(0.25,0.75),trim = TRUE,linetype="dashed",fill="transparent")+
+  geom_violin(draw_quantiles = 0.5,trim = TRUE,fill="transparent")+
+  stat_summary(fun=mean,geom = "point",col="blue") +
+  geom_hline(yintercept=1,col="red")+
+  geom_hline(yintercept = 0.4565759,col="blue")+theme_bw()+
+  labs(y="Error",title = "Residual Error By Lot Type",subtitle = "violin plot")+
+  theme(plot.title = element_text(hjust = 0.5),axis.text.x = element_text(angle = 60, hjust=1),plot.subtitle = element_text(hjust=0.5))
+
+
+```
+
+the added lines to the violin plot mark the quantiles (sheer line being the median, dashed lines being the 25 and 75  percentile, as well as a dotted line representing the 90 percentile), as well as a dot marking the mean in each group
+
+here we can see that while the 75% mark fall below the RMSE the 90% mark is above it, but below the value of 1. Thiss shows that there are few lots for which the prediction was significantly off.
+even for the "other" category, for which the prediction is the weakest most of the values and even the mean value is below the global mean.
+
+when we make a similar plot without the outliers we get the following:
+```{r echo=FALSE}
+fixed_preds %>% select(type,price,.pred) %>% mutate(res_squared = (price-.pred)^2) %>% mutate(RSE = sqrt(res_squared)) %>% ggplot(aes(x=type,y=RSE)) +
+  geom_violin(draw_quantiles = 0.9,trim = TRUE,linetype="dotted")+
+  geom_violin(draw_quantiles = c(0.25,0.75),trim = TRUE,linetype="dashed",fill="transparent")+
+  geom_violin(draw_quantiles = 0.5,trim = TRUE,fill="transparent")+
+  stat_summary(fun=mean,geom = "point",col="blue") +
+  geom_hline(yintercept=1,col="red")+
+  geom_hline(yintercept = 0.4565759,col="blue")+
+  geom_rect(aes(xmin=0,xmax=3.6,ymin=0.01,ymax=0.2),fill="yellow",alpha=0.005)+
+  theme_bw()+
+  labs(y="Error",title = "Residual Error By Lot Type")+
+  theme(plot.title = element_text(hjust = 0.5),axis.text.x = element_text(angle = 60, hjust=1))
+  
+```
+
+this allows us to better see the shape of the distributions for each class, we can see the bulk of the distribution mass is around the 0.01-0.2 area of the plot (highlighted in yellow), showing that the prediction quality is n fact higher than the RMSE would suggest in many cases
+
+
+We can also assess how well the model handles the various room counts:
+```{r}
+fixed_preds %>% mutate(err = sqrt(res_squared)) %>% ggplot(aes(group=rooms,y=err)) +
+  geom_boxplot()+
+  geom_hline(yintercept =1,color="red")+
+  geom_hline(yintercept =  0.4565759, color="blue" )+
+  theme_bw()+
+  scale_x_continuous(breaks=seq(-0.35,0.35,length=16),labels=sort(unique(rent_test$rooms))) +
+  labs(y="Error",title = "Residual Error By Number of Rooms",x="Number of Rooms")+
+  theme(plot.title = element_text(hjust = 0.5),plot.subtitle = element_text(hjust=0.5))
+
+```
+
+in this case the model struggles mostly with very high room counts, though there are some single cases for smaller room counts where the model fails as well. as we have seen before there are extremely few lots with a very large number of rooms thus it is likely that the model could not analyze those instances well
+
+as before, we can see that the model performs well in most "usual" applications, but there is still room for improvement 
+
+#limitations of the model
+- the data has been acquired from a single market place, thus it is hard to guarantee the results represent the entire real estate marked
+- the real estate market is very dynamic, thus the result of the model pertain mostly to the time period around which the postings were collected, and would need periodic updates to keep up with market trends
+
